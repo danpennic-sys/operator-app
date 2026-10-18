@@ -17,6 +17,7 @@ export class OpsController {
     this.lastError = null;
     this.schedules = [];
     this.health = "unknown";
+    this._applyInFlight = false;
   }
 
   viewModel() {
@@ -46,17 +47,32 @@ export class OpsController {
     const r = await callTool(this.mcpUrl, "list_schedules", {
       enabled_only: enabledOnly,
     });
-    if (r.status === 0 || r.body?.error) {
+
+    if (r.status === 0 || r.status < 200 || r.status >= 300) {
       this.health = "offline";
       this.lastError =
-        r.body?.error?.message || r.body?.error?.code || "mcp_unavailable";
+        r.body?.error?.message ||
+        r.body?.error?.code ||
+        (r.status ? `http_${r.status}` : "mcp_unavailable");
       this.schedules = [];
       return this.viewModel();
     }
-    this.health = "ok";
-    this.lastError = null;
-    const list = Array.isArray(r.body?.schedules) ? r.body.schedules : [];
-    this.schedules = list
+
+    if (r.body?.error) {
+      this.health = "offline";
+      this.lastError = r.body.error.message || r.body.error.code || "store_error";
+      this.schedules = [];
+      return this.viewModel();
+    }
+
+    if (!r.body || typeof r.body !== "object" || !Array.isArray(r.body.schedules)) {
+      this.health = "degraded";
+      this.lastError = "invalid_schedule_payload";
+      this.schedules = [];
+      return this.viewModel();
+    }
+
+    this.schedules = r.body.schedules
       .filter((s) => s && typeof s === "object" && s.id != null && s.agent_id != null)
       .map((s) => ({
         id: String(s.id),
@@ -68,6 +84,9 @@ export class OpsController {
         max_concurrent: Number(s.max_concurrent) || 1,
         wait_timeout_secs: Number(s.wait_timeout_secs) || 300,
       }));
+
+    this.health = "ok";
+    this.lastError = null;
     return this.viewModel();
   }
 
@@ -82,8 +101,22 @@ export class OpsController {
   }
 
   async apply() {
+    if (this._applyInFlight) {
+      return {
+        status: "rejected",
+        message: "apply_in_flight",
+        applied: [],
+        blocked: this.proposals,
+        results: [],
+        view: this.viewModel(),
+      };
+    }
+
+    const confirmedSnapshot = this.confirmed === true;
+    this.confirmed = false;
+
     const decision = confirmApply(this.proposals, {
-      confirmed: this.confirmed,
+      confirmed: confirmedSnapshot,
       allowPending: false,
     });
     if (decision.status === "rejected") {
@@ -102,21 +135,26 @@ export class OpsController {
         view: this.viewModel(),
       };
     }
-    const mcpCalls = decision.applied.filter((a) => a.action === "mcp_call");
-    const results = await applyProposals(this.mcpUrl, mcpCalls);
-    const failed = results.filter((r) => !r.skipped && !r.ok);
-    const applyError = failed.length
-      ? failed.map((f) => f.body?.error?.code || "apply_failed").join(",")
-      : null;
-    this.confirmed = false;
-    await this.refreshSchedules(false);
-    if (applyError) {
-      this.lastError = applyError;
+
+    this._applyInFlight = true;
+    try {
+      const mcpCalls = decision.applied.filter((a) => a.action === "mcp_call");
+      const results = await applyProposals(this.mcpUrl, mcpCalls);
+      const failed = results.filter((r) => !r.skipped && !r.ok);
+      const applyError = failed.length
+        ? failed.map((f) => f.body?.error?.code || "apply_failed").join(",")
+        : null;
+      await this.refreshSchedules(false);
+      if (applyError) {
+        this.lastError = applyError;
+      }
+      return {
+        ...decision,
+        results,
+        view: this.viewModel(),
+      };
+    } finally {
+      this._applyInFlight = false;
     }
-    return {
-      ...decision,
-      results,
-      view: this.viewModel(),
-    };
   }
 }
