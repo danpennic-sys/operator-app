@@ -1,0 +1,14 @@
+{
+  "name": "@op/ops",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/mcp_client.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "license": "MIT",
+  "description": "Operations module: schedules, proposals, confirm-before-apply via Operator Pages MCP"
+}
