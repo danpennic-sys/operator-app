@@ -87,6 +87,8 @@ describe("release gate: malformed MCP responses", () => {
       const ops = new OpsController({ mcpUrl: "http://127.0.0.1:8787" });
       const vm = await ops.refreshSchedules();
       assert.equal(vm.schedules.length, 0);
+      assert.equal(vm.health, "degraded");
+      assert.equal(vm.last_error, "invalid_schedule_payload");
     } finally {
       globalThis.fetch = orig;
     }
@@ -222,6 +224,92 @@ describe("release gate: duplicate apply", () => {
       assert.equal(write.ok, false);
       assert.equal(write.body.error.code, "already_registered");
       assert.ok(ops.viewModel().last_error);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});
+
+describe("release gate: invalid shape and HTTP status", () => {
+  it("schedules not array → degraded, not ok", async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ schedules: "not-an-array" }), { status: 200 });
+    try {
+      const ops = new OpsController({ mcpUrl: "http://127.0.0.1:8787" });
+      const vm = await ops.refreshSchedules();
+      assert.equal(vm.health, "degraded");
+      assert.equal(vm.last_error, "invalid_schedule_payload");
+      assert.equal(vm.schedules.length, 0);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("HTTP 500 → offline", async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error: "internal" }), { status: 500 });
+    try {
+      const ops = new OpsController({ mcpUrl: "http://127.0.0.1:8787" });
+      const vm = await ops.refreshSchedules();
+      assert.equal(vm.health, "offline");
+      assert.equal(vm.schedules.length, 0);
+      assert.match(String(vm.last_error), /http_500|internal/i);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("valid empty schedules array → ok", async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ schedules: [] }), { status: 200 });
+    try {
+      const ops = new OpsController({ mcpUrl: "http://127.0.0.1:8787" });
+      const vm = await ops.refreshSchedules();
+      assert.equal(vm.health, "ok");
+      assert.equal(vm.schedules.length, 0);
+      assert.equal(vm.last_error, null);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+});
+
+describe("release gate: concurrent apply", () => {
+  it("two simultaneous apply() calls — only one issues writes", async () => {
+    let registerCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("register_schedule")) {
+        registerCalls += 1;
+        await new Promise((r) => setTimeout(r, 40));
+        return new Response(
+          JSON.stringify({ schedule_id: "backup", persisted: true }),
+          { status: 200 }
+        );
+      }
+      if (u.includes("list_schedules")) {
+        return new Response(JSON.stringify({ schedules: [] }), { status: 200 });
+      }
+      return new Response("{}");
+    };
+    try {
+      const ops = new OpsController({
+        mcpUrl: "http://127.0.0.1:8787",
+        allowlist: ["backup"],
+      });
+      ops.setProposals([reg("backup")]);
+      ops.confirm();
+      const [a, b] = await Promise.all([ops.apply(), ops.apply()]);
+      assert.equal(
+        [a, b].filter((x) => x.status === "confirmed").length,
+        1,
+        "exactly one apply may succeed"
+      );
+      assert.equal(registerCalls, 1, "exactly one register_schedule write");
     } finally {
       globalThis.fetch = orig;
     }
